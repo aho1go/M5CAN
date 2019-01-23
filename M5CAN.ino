@@ -24,13 +24,6 @@
 
 //#define CANDUMMY
 
-#ifndef max
-#define max(a, b) ((a) > (b) ? (a) : (b))
-#endif
-
-#ifndef min
-#define min(a, b) ((a) < (b) ? (a) : (b))
-#endif
 
 #define ConvBtoA(a) ("0123456789ABCDEF"[a & 0x0F])
 #define CONV_AtoB(a) ((a >= 'a') ? (a - 'a' + 10) : (a >= 'A') ? (a - 'A' + 10) : (a >= 0) ? (a - '0') : 0)
@@ -42,7 +35,7 @@
 #define CANLCD_TASKID   0
 #define INPUT_TASKID    1
 #define OUTPUT_TASKID   2
-#define DOS_TASKID      3
+#define PERIODIC_TASKID      3
 #define TASKMAX         4
 TaskHandle_t hTask[TASKMAX];
 
@@ -53,13 +46,27 @@ QueueHandle_t xCANLCDMsgQue;
 QueueHandle_t xCANSendMsgQue;
 QueueHandle_t xOutputMsgQue;
 
+
+// =================
+//  list of Event
+// =================
+#define CANLCDEVT_CANOPEN   (1 << 0)
+#define CANLCDEVT_CANCLOSE  (1 << 1)
+#define CANLCDEVT_CANRECV   (1 << 2)
+#define CANLCDEVT_CANSEND   (1 << 3)
+#define CANLCDEVT_LCDDISP   (1 << 4)
+#define CANLCDEVT_ALL       (CANLCDEVT_CANOPEN | CANLCDEVT_CANCLOSE | CANLCDEVT_CANRECV | CANLCDEVT_CANSEND | CANLCDEVT_LCDDISP)
+
+EventGroupHandle_t  xCANLCDEvtGrp;
+
+
 // =================
 //  Definition of strctured value
 // =================
 typedef struct OutputMessage {    // 12345678901234567890123456789012
   char msg[32];                   // t99981122334455667788FFFFFFFF
 } OUTPUTMESSAGE;
-#define OUTPUTMESSAGE_QMAX  40
+#define OUTPUTMESSAGE_QMAX  100
 
 typedef struct CANMessage {
   unsigned long ID;
@@ -68,19 +75,62 @@ typedef struct CANMessage {
 } CANMESSAGE;
 #define CANMESSAGE_QMAX  40
 
-typedef struct CANLCDMessage {
-  byte msg;
-} CANLCDMESSAGE;
-#define CANLCDMESSAGE_QMAX  20
-#define CANLCDMSG_CANOPEN   0
-#define CANLCDMSG_CANCLOSE  1
-#define CANLCDMSG_CANRECV   2
-#define CANLCDMSG_CANSEND   3
-#define CANLCDMSG_LCDDISP   4
-
+File file;
 const char* M5CAN_HWStr = "M5CAN";
 const char* M5CAN_HWVer = "V0100";
-const char* M5CAN_SWVer = "v0003";
+const char* M5CAN_SWVer = "v0004";
+
+#define RECVLOGMAX  5
+OUTPUTMESSAGE recvlog[RECVLOGMAX];
+int recvlog_idx = 0;
+
+// =================
+//  SD
+// =================
+char file1[128];
+char file2[128];
+char file3[128];
+
+// =================
+void readFile(fs::FS &fs, const char * path, char* buf, int len) {
+//  Serial.printf("Reading file: %s\n", path);
+  
+  File file = fs.open(path);
+  if(!file){
+    return;
+  }
+  
+//  Serial.print("Read from file: ");
+  for( int i=0; i<len-1; i++) {
+    if(!file.available()) {
+      break;
+    }
+    int ch = file.read();
+  
+    buf[i] = (char)ch;
+    buf[i+1] = '\0';
+  }
+  file.close();
+}
+
+// =================
+void SD_setup(void) {
+  char* ptr;
+
+  if(!SD.begin()){
+//    Serial.println("Card Mount Failed");
+    return;
+  }
+
+  memset(file1, 0, sizeof(file1));
+  memset(file2, 0, sizeof(file2));
+  memset(file3, 0, sizeof(file3));
+  
+  readFile(SD, "/button1.txt", file1, sizeof(file1));
+  readFile(SD, "/button2.txt", file2, sizeof(file2));
+  readFile(SD, "/button3.txt", file3, sizeof(file3));
+//  Serial.println(file1);
+}
 
 
 // =================
@@ -91,11 +141,14 @@ static uint8_t can_mode = MCP_LISTENONLY;
 static uint8_t can_tsmode = 0;
 volatile int can_rxCnt = 0;
 volatile int can_txCnt = 0;
-static int can_dosmode = 0;
-static uint32_t can_doscycle = 0;
-static uint32_t can_dostimes = 0;
-static bool can_dosincrement = false;
-static CANMESSAGE can_dosmsg;
+volatile int can_rxErrCnt = 0;
+volatile int can_txErrCnt = 0;
+volatile int can_rxPPS = 0;
+static int can_periodicmode = 0;
+static uint32_t can_periodiccycle = 0;
+static uint32_t can_periodictimes = 0;
+static bool can_periodicincrement = false;
+static CANMESSAGE can_periodicmsg;
 
 const INT8U can_speedtbl[] = {
   CAN_10KBPS,
@@ -117,13 +170,10 @@ MCP_CAN CAN(CAN_CSPIN);
 
 // =================
 void IRAM_ATTR CAN_RecvIsr() {
-  BaseType_t xHigherPriorityTaskWoken;
+  BaseType_t xHigherPriorityTaskWoken, xResult;
 
-  CANLCDMESSAGE  msg;
-  msg.msg = CANLCDMSG_CANRECV;
-  xQueueSendToFrontFromISR(xCANLCDMsgQue, &msg, &xHigherPriorityTaskWoken);
-
-  if (xHigherPriorityTaskWoken) {
+  xResult = xEventGroupSetBitsFromISR(xCANLCDEvtGrp, CANLCDEVT_CANRECV, &xHigherPriorityTaskWoken);
+  if(xResult != pdFAIL) {
     portYIELD_FROM_ISR();
   }
 }
@@ -205,8 +255,9 @@ void WIFILoop() {
     WIFI_bConnected = true;
     
     while(client.available()) {             // if there's bytes to read from the client,
+      bool input_slcancmd(char* buf, char bufmax, char* pCnt, char ch, bool bFile);
       char c = client.read();             // read a byte, then
-      input_slcancmd(WIFI_recvBuf, sizeof(WIFI_recvBuf), &WIFI_recvCnt, c);
+      input_slcancmd(WIFI_recvBuf, sizeof(WIFI_recvBuf), &WIFI_recvCnt, c, false);
     }
   } else {
     if(WIFI_bConnected) {
@@ -236,7 +287,6 @@ bool parse_slcancmd(char *cmd)
 {
   bool bResult = true;
   OUTPUTMESSAGE outmsg;
-  CANLCDMESSAGE  evtmsg;
 
 //  Serial.println(cmd);
 
@@ -253,47 +303,42 @@ bool parse_slcancmd(char *cmd)
       break;
     }
     case 'O': { //  Open the CAN channel in normal mode (sending & receiving).
-      can_dosmode = 0;
+      can_periodicmode = 0;
       can_mode = MCP_NORMAL;
-      evtmsg.msg = CANLCDMSG_CANOPEN;
-      xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+      xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANOPEN);
       break;
     }
     case 'l': { //  Open the CAN channel in loopback mode (loopback & receiving).
-      can_dosmode = 0;
+      can_periodicmode = 0;
       can_mode = MCP_LOOPBACK;
-      evtmsg.msg = CANLCDMSG_CANOPEN;
-      xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+      xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANOPEN);
       break;
     }
     case 'L': { //  Open the CAN channel in listen only mode (receiving).
-      can_dosmode = 0;
+      can_periodicmode = 0;
       can_mode = MCP_LISTENONLY;
-      evtmsg.msg = CANLCDMSG_CANOPEN;
-      xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+      xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANOPEN);
       break;
     }
     case 'C': { //  Close the CAN channel.
-      evtmsg.msg = CANLCDMSG_CANCLOSE;
-      xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+      xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANCLOSE);
       break;
     }
-    case 'D': { //  Open the CAN channel in DoS and normal mode (sending & receiving)
+    case 'D': { //  Open the CAN channel in Periodic send and normal mode (sending & receiving)
       //  Dttttttnnnn
       if(strlen(cmd) < 11) {
         bResult = false;
       } else {
         if(strlen(cmd) == 12) {
-          can_dosincrement = (cmd[11] == '1' ? true: false);  
+          can_periodicincrement = (cmd[11] == '1' ? true: false);  
           cmd[11] = '\0';
         }
-        can_dostimes = atoi(&cmd[7]);
+        can_periodictimes = atoi(&cmd[7]);
         cmd[7] = '\0';
-        can_doscycle = atol(&cmd[1]);
-        can_dosmode = 1;
+        can_periodiccycle = atol(&cmd[1]);
+        can_periodicmode = 1;
         can_mode = MCP_NORMAL;
-        evtmsg.msg = CANLCDMSG_CANOPEN;
-        xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+        xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANOPEN);
       }
       break;
     }
@@ -349,17 +394,14 @@ bool parse_slcancmd(char *cmd)
       }
   
       if(bResult) {
-        if(can_dosmode == 1) {
-          can_dosmsg.ID = canmsg.ID;
-          can_dosmsg.DLC = canmsg.DLC;
-          memcpy(can_dosmsg.Data, canmsg.Data, sizeof(can_dosmsg.Data)); 
-          can_dosmode = 2;
+        if(can_periodicmode == 1) {
+          can_periodicmsg.ID = canmsg.ID;
+          can_periodicmsg.DLC = canmsg.DLC;
+          memcpy(can_periodicmsg.Data, canmsg.Data, sizeof(can_periodicmsg.Data)); 
+          can_periodicmode = 2;
         } else {
-          CANLCDMESSAGE  evtmsg;
-  
           xQueueSend(xCANSendMsgQue, &canmsg, NULL);
-          evtmsg.msg = CANLCDMSG_CANSEND;
-          xQueueSendToFront(xCANLCDMsgQue, &evtmsg, NULL);
+          xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANSEND);
         }
       }
       break;
@@ -414,8 +456,14 @@ bool parse_slcancmd(char *cmd)
 }
 
 // =================
-bool input_slcancmd(char* buf, char bufmax, char* pCnt, char ch) {
+bool input_slcancmd(char* buf, char bufmax, char* pCnt, char ch, bool bFile) {
   char len = *pCnt;
+
+  if(bFile) {
+    if(ch == ',') {
+      ch = '\r';
+    }
+  }
   
   if(ch == '\r' || ch == '\n') {
     if(len > 0) {
@@ -448,19 +496,76 @@ void SERIALLoop() {
 
   while(Serial.available()) {
     ch = Serial.read();
-    input_slcancmd(serial_recvBuf, sizeof(serial_recvBuf), &serial_recvCnt, ch);
+    input_slcancmd(serial_recvBuf, sizeof(serial_recvBuf), &serial_recvCnt, ch, false);
   }
 }
 
 
 // =================
-//  Serial/Wi-Fi Input Task
+//  File
+// =================
+char* file_chrptr = NULL;
+char file_recvBuf[32];
+char file_recvCnt = 0;
+
+void beep() {
+  // Beep (silent)
+  for(int i=0; i<10; i++) {
+    dacWrite(SPEAKER_PIN, 6);
+    delayMicroseconds(2272/2);
+    dacWrite(SPEAKER_PIN, 0);
+    delayMicroseconds(2272/2);
+  }
+}
+
+void FILELoop() {
+  char ch;
+
+  if(M5.BtnA.wasPressed()) {
+    if(file_chrptr == NULL) {
+      file_chrptr = file1;
+      beep();
+      vTaskDelay(100);
+    }
+  }
+
+  if(M5.BtnB.wasPressed()) {
+    if(file_chrptr == NULL) {
+      file_chrptr = file2;
+      beep();
+      vTaskDelay(100);
+    }
+  }
+
+  if(M5.BtnC.wasPressed()) {
+    if(file_chrptr == NULL) {
+      file_chrptr = file3;
+      beep();
+      vTaskDelay(100);
+    }
+  }
+  
+  if(file_chrptr != NULL) {
+    ch = *file_chrptr ++;
+    if(ch == '\0') {
+      file_chrptr = NULL;
+      ch = '\r';
+    }
+    input_slcancmd(file_recvBuf, sizeof(file_recvBuf), &file_recvCnt, ch, true);
+  }
+}
+
+
+// =================
+//  Serial/Wi-Fi/File Input Task
 // =================
 void Input_Task(void *pvParameters) {
   while(true) {
     SERIALLoop();
     vTaskDelay(1);
     WIFILoop();
+    vTaskDelay(1);
+    FILELoop();
     vTaskDelay(1);
   }
 }
@@ -491,74 +596,124 @@ static int display_sequencer = 0;
 
 // =================
 void Display_Init() {
-  display_sequencer = -1;
+  display_sequencer = -4;
 }
 
 // =================
 void Display_Banner() {
+  int xpos, ypos;
+  
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextColor(WHITE, BLACK);
-  M5.Lcd.setFreeFont(FF1);
-  M5.Lcd.drawString(M5CAN_HWStr, (int)(M5.Lcd.width()/2), (int)(M5.Lcd.height()/2));
+  M5.Lcd.setFreeFont(FM12);
+  xpos = (M5.Lcd.width()/4)*3;
+  ypos = M5.Lcd.height()/2;
+  M5.Lcd.drawRightString(M5CAN_HWStr, xpos, ypos, GFXFF);
+  M5.Lcd.setFreeFont(FM9);
+  ypos += M5.Lcd.fontHeight(GFXFF)*2;
+  M5.Lcd.drawRightString(M5CAN_SWVer, xpos, ypos, GFXFF);
+  ypos += M5.Lcd.fontHeight(GFXFF);
+  M5.Lcd.drawRightString("Useful CAN Tool", xpos, ypos, GFXFF);
   M5.update();
   vTaskDelay(1000);
   M5.Lcd.fillScreen(BLACK);
   M5.update();
-  display_sequencer = -1;
+  display_sequencer = -4;
 }
 
 // =================
 void Display() {
   static int xpos, ypos;
   char buf[40];
-  
+  unsigned long tm;
+
+  tm = micros();
   switch(display_sequencer) {
-    case -1: {
+    case -4: {
       M5.Lcd.fillScreen(BLACK);
-      break;
-    }
-    case 0: {
+      M5.Lcd.setTextSize(2);
+      M5.Lcd.setTextFont(FONT8);
       xpos = 0;
       ypos = 0;
-      
-      //  Indicate Wi-Fi Connection
-      if(WIFIConnected()) {
-        M5.Lcd.setTextColor(BLACK, GREEN);
-      } else {
-        M5.Lcd.setTextColor(WHITE, BLACK);
-      }
-      M5.Lcd.drawString("Wi-Fi", 120, 0);
-      break;  
+      break;
     }
-    case 1: {
-      M5.Lcd.setFreeFont(FM9);
+    case -3: {
       M5.Lcd.setTextColor(WHITE, BLACK);
       M5.Lcd.setCursor(0,24);
       M5.Lcd.drawString(M5CAN_HWStr, xpos, ypos, GFXFF);
       ypos += M5.Lcd.fontHeight(GFXFF);
       break;
     }
-    case 2: {
-      sprintf(buf,"Rx:%d\r\n", can_rxCnt);
-      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
-      ypos += M5.Lcd.fontHeight(GFXFF);
-      break;
-    }
-    case 3: {
-      sprintf(buf,"Tx:%d\r\n", can_txCnt);
-      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
-      ypos += M5.Lcd.fontHeight(GFXFF);
-      break;
-    }
-    case 4: {
+    case -2: {
       sprintf(buf,"SSID:%s\r\n", ssidbuf);
       M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
       ypos += M5.Lcd.fontHeight(GFXFF);
       break;
     }
-    case 5: {
+    case -1: {
       IPAddress myIP = WiFi.softAPIP();
       sprintf(buf,"IP:%d.%d.%d.%d\r\n", myIP[0], myIP[1], myIP[2], myIP[3]);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF);
+      break;
+    }
+    case 0: {
+      M5.Lcd.setTextSize(2);
+      M5.Lcd.setTextFont(FONT8);
+      xpos = 0;
+      ypos = M5.Lcd.fontHeight(GFXFF)*4;
+      //  Indicate Wi-Fi Connection
+      if(WIFIConnected()) {
+        M5.Lcd.setTextColor(BLACK, GREEN);
+      } else {
+        M5.Lcd.setTextColor(WHITE, BLACK);
+      }
+      M5.Lcd.drawString("Wi-Fi", 240, 0, GFXFF);
+      break;  
+    }
+    case 1: {
+      sprintf(buf,"Rx:%d", can_rxCnt);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF);
+      break;
+    }
+    case 2: {
+      sprintf(buf,"Tx:%d", can_txCnt);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF);
+      break;
+    }
+    case 3: {
+      sprintf(buf,"RxErr:%d", can_rxErrCnt);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF);
+      break;
+    }
+    case 4: {
+      sprintf(buf,"TxErr:%d", can_txErrCnt);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF);
+      break;
+    }
+    case 5: {
+      sprintf(buf,"RxPPS:%d", can_rxPPS);
+      M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
+      ypos += M5.Lcd.fontHeight(GFXFF)*2;
+      break;
+    }
+
+    case 6:
+    case 7:
+    case 8:
+    case 9:
+    case 10: {
+      int idx = (recvlog_idx+display_sequencer-6) % RECVLOGMAX;
+      
+      M5.Lcd.setTextSize(1);
+      sprintf(buf,recvlog[idx].msg);
+      for(int i=strlen(buf); i<26+8; i++) {
+        strcat(buf, " ");
+      }
       M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
       ypos += M5.Lcd.fontHeight(GFXFF);
       break;
@@ -578,7 +733,6 @@ void Display() {
 // =================
 void CANLCD_Task(void *pvParameters) {
   CANMESSAGE canmsg;
-  CANLCDMESSAGE evtmsg;
   OUTPUTMESSAGE outmsg;
   char* msgbuf = outmsg.msg;
   char msgbufIdx;
@@ -590,125 +744,131 @@ void CANLCD_Task(void *pvParameters) {
   CAN_setup();
  
   while(true) {
-    while(xQueueReceive(xCANLCDMsgQue, &evtmsg, portMAX_DELAY)) {
-      switch(evtmsg.msg) {
-        case CANLCDMSG_CANRECV: {
-#ifndef CANDUMMY
-          while(CAN.checkReceive()==CAN_MSGAVAIL) {
-            CAN.readMsgBuf(&canmsg.ID, &canmsg.DLC, canmsg.Data);
-#else
-          if(true) {
-            CAN_DummyRecv(&canmsg);
-#endif
-            if(can_tsmode==1) {
-              tm = millis();
-            } else if(can_tsmode==9) {
-              tm = micros();
-            }
+    EventBits_t uxBits;
+    
+    uxBits = xEventGroupWaitBits(
+              xCANLCDEvtGrp,
+              CANLCDEVT_ALL,
+              pdTRUE,
+              pdFALSE,
+              portMAX_DELAY );
 
-            msgbufIdx = 0;
-            //  Set prefix (t,T,r,R)
-            msgbuf[msgbufIdx++] = ((canmsg.ID & 0x80000000) ?
-                                    ((canmsg.ID & 0x40000000) ? 'R' : 'T') :
-                                    ((canmsg.ID & 0x40000000) ? 'r' : 't'));
-            if(canmsg.ID & 0x80000000) {
-              //  Extended ID
-              canmsg.ID &= 0x1FFFFFFF;
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>28); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>24);
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>20); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>16);
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>12); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>8);
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>4);  msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>0);
-            } else {
-              //  Normal ID
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>8);
-              msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>4);  msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>0);
-            }
-            //  Set DLC
-            canmsg.DLC = min(canmsg.DLC, (byte)8);
-            msgbuf[msgbufIdx++] = ConvBtoA(canmsg.DLC);
-            if((canmsg.ID & 0x40000000) == 0) {  // RTR is not contain DATA FIELD
-              //  Set Payload Data
-              for(int i=0; i<canmsg.DLC; i++) {
-                msgbuf[msgbufIdx++] = ConvBtoA(canmsg.Data[i]>>4); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.Data[i]>>0);
-              }
-            }
-            if(can_tsmode==1) {
-              tm = tm % 60000;    //  LAWICEL CAN232 - Z command
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>12); msgbuf[msgbufIdx++] = ConvBtoA(tm>>8);
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>4);  msgbuf[msgbufIdx++] = ConvBtoA(tm>>0);
-            } else if(can_tsmode==9) {
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>28); msgbuf[msgbufIdx++] = ConvBtoA(tm>>24);
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>20); msgbuf[msgbufIdx++] = ConvBtoA(tm>>16);
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>12); msgbuf[msgbufIdx++] = ConvBtoA(tm>>8);
-              msgbuf[msgbufIdx++] = ConvBtoA(tm>>4);  msgbuf[msgbufIdx++] = ConvBtoA(tm>>0);
-            }
-            //  Set Delimiter and terminator
-            msgbuf[msgbufIdx++] = '\r';
-            msgbuf[msgbufIdx++] = '\0';
+    if(uxBits & CANLCDEVT_CANRECV) {
+      if(CAN.checkError()==CAN_CTRLERROR) {
+        can_rxErrCnt += CAN.errorCountRX();
+        can_txErrCnt += CAN.errorCountTX();
+      }
 
-            xQueueSend(xOutputMsgQue, &outmsg, NULL);
-            can_rxCnt ++;
+      while(CAN.checkReceive()==CAN_MSGAVAIL) {
+        CAN.readMsgBuf(&canmsg.ID, &canmsg.DLC, canmsg.Data);
+        if(can_tsmode==1) {
+          tm = millis();
+        } else if(can_tsmode==9) {
+          tm = micros();
+        }
+
+        msgbufIdx = 0;
+        //  Set prefix (t,T,r,R)
+        msgbuf[msgbufIdx++] = ((canmsg.ID & 0x80000000) ?
+                                ((canmsg.ID & 0x40000000) ? 'R' : 'T') :
+                                ((canmsg.ID & 0x40000000) ? 'r' : 't'));
+        if(canmsg.ID & 0x80000000) {
+          //  Extended ID
+          canmsg.ID &= 0x1FFFFFFF;
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>28); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>24);
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>20); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>16);
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>12); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>8);
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>4);  msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>0);
+        } else {
+          //  Normal ID
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>8);
+          msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>4);  msgbuf[msgbufIdx++] = ConvBtoA(canmsg.ID>>0);
+        }
+        //  Set DLC
+        canmsg.DLC = (canmsg.DLC < (byte)8) ? canmsg.DLC : (byte)8;
+        msgbuf[msgbufIdx++] = ConvBtoA(canmsg.DLC);
+        if((canmsg.ID & 0x40000000) == 0) {  // RTR is not contain DATA FIELD
+          //  Set Payload Data
+          for(int i=0; i<canmsg.DLC; i++) {
+            msgbuf[msgbufIdx++] = ConvBtoA(canmsg.Data[i]>>4); msgbuf[msgbufIdx++] = ConvBtoA(canmsg.Data[i]>>0);
           }
-          break;
         }
-        case CANLCDMSG_CANOPEN: {
-          CAN_setup();
-          if(can_dosmode != 0) {
-            CAN.enOneShotTX();
-          } else {
-            CAN.disOneShotTX();
-          }
-          break;
+        if(can_tsmode==1) {
+          tm = tm % 60000;    //  LAWICEL CAN232 - Z command
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>12); msgbuf[msgbufIdx++] = ConvBtoA(tm>>8);
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>4);  msgbuf[msgbufIdx++] = ConvBtoA(tm>>0);
+        } else if(can_tsmode==9) {
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>28); msgbuf[msgbufIdx++] = ConvBtoA(tm>>24);
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>20); msgbuf[msgbufIdx++] = ConvBtoA(tm>>16);
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>12); msgbuf[msgbufIdx++] = ConvBtoA(tm>>8);
+          msgbuf[msgbufIdx++] = ConvBtoA(tm>>4);  msgbuf[msgbufIdx++] = ConvBtoA(tm>>0);
         }
-        case CANLCDMSG_CANCLOSE: {
-          CAN_close();
-          break;
+        //  Set Delimiter and terminator
+        msgbuf[msgbufIdx++] = '\r';
+        msgbuf[msgbufIdx++] = '\0';
+
+
+        strcpy(recvlog[can_rxCnt % RECVLOGMAX].msg, outmsg.msg);
+        if(can_rxCnt >= RECVLOGMAX) {
+          recvlog_idx = (recvlog_idx+1) % RECVLOGMAX;
         }
-        case CANLCDMSG_CANSEND: {
-          xQueueReceive(xCANSendMsgQue, &canmsg, portMAX_DELAY);
-          CAN.sendMsgBuf(canmsg.ID, canmsg.DLC, (byte*)canmsg.Data);
-          can_txCnt ++;
-          break;
-        }
-        case CANLCDMSG_LCDDISP: {
-          Display();
-          break;
-        }
-      }  
+
+        xQueueSend(xOutputMsgQue, &outmsg, NULL);
+        can_rxCnt ++;
+      }
     }
+    if(uxBits & CANLCDEVT_CANOPEN) {
+      CAN_setup();
+      if(can_periodicmode != 0) {
+        CAN.enOneShotTX();
+      } else {
+        CAN.disOneShotTX();
+      }
+      for(int i=0; i<RECVLOGMAX; i++) {
+        strcpy(recvlog[recvlog_idx].msg, "");
+      }
+    }
+    if(uxBits & CANLCDEVT_CANCLOSE) {
+      CAN_close();
+    }
+    if(uxBits & CANLCDEVT_CANSEND) {
+      xQueueReceive(xCANSendMsgQue, &canmsg, portMAX_DELAY);
+      CAN.sendMsgBuf(canmsg.ID, canmsg.DLC, (byte*)canmsg.Data);
+      can_txCnt ++;
+    }
+    if(uxBits & CANLCDEVT_LCDDISP) {
+      Display();
+    } 
   }
 }
 
 
 // =================
-//  DoS Task
+//  Periodic Send Task
 // =================
-void Dos_IncMsg(void) {
+void Periodic_IncMsg(void) {
   uint64_t  cnt = 0;
   byte*  cnt_wk = (byte*)&cnt;
 
-  if(can_dosmsg.DLC > 0) {
-    for(int i=0; i<(int)can_dosmsg.DLC; i++)  cnt_wk[i] = can_dosmsg.Data[can_dosmsg.DLC-1-i];
+  if(can_periodicmsg.DLC > 0) {
+    for(int i=0; i<(int)can_periodicmsg.DLC; i++)  cnt_wk[i] = can_periodicmsg.Data[can_periodicmsg.DLC-1-i];
     cnt ++;
-    for(int i=0; i<(int)can_dosmsg.DLC; i++)  can_dosmsg.Data[i] = cnt_wk[can_dosmsg.DLC-1-i];
+    for(int i=0; i<(int)can_periodicmsg.DLC; i++)  can_periodicmsg.Data[i] = cnt_wk[can_periodicmsg.DLC-1-i];
   }
 }
 
-void DoS_Task(void *pvParameters) {
+void Periodic_Task(void *pvParameters) {
   while(true) {
-    if(can_dosmode==2) {
-      CANLCDMESSAGE  evtmsg;
-
-      for(uint32_t i=0; i<can_dostimes; i++) {
-        xQueueSend(xCANSendMsgQue, &can_dosmsg, NULL);
-        evtmsg.msg = CANLCDMSG_CANSEND;
-        xQueueSend(xCANLCDMsgQue, &evtmsg, NULL);
-        if(can_dosincrement) {
-          Dos_IncMsg();
+    if(can_periodicmode==2) {
+      for(uint32_t i=0; i<can_periodictimes; i++) {
+        xQueueSend(xCANSendMsgQue, &can_periodicmsg, NULL);
+        xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_CANSEND);
+        if(can_periodicincrement) {
+          Periodic_IncMsg();
         }
-        vTaskDelay(can_doscycle);
+        vTaskDelay(can_periodiccycle);
       }
-      can_dosmode = 0;
+      can_periodicmode = 0;
     }
     vTaskDelay(100);
   }
@@ -726,32 +886,44 @@ void setup() {
   
   Display_Banner();
 
-  xCANLCDMsgQue = xQueueCreate(CANLCDMESSAGE_QMAX, sizeof(CANLCDMESSAGE));
+  SD_setup();
+
+  xCANLCDEvtGrp = xEventGroupCreate();
+
   xCANSendMsgQue = xQueueCreate(CANMESSAGE_QMAX, sizeof(CANMESSAGE));
   xOutputMsgQue = xQueueCreate(OUTPUTMESSAGE_QMAX, sizeof(OUTPUTMESSAGE));
 
   WIFIInit();
 
-  xTaskCreatePinnedToCore(Output_Task,"Output_Task", 4096, NULL, 2, &hTask[OUTPUT_TASKID], 1);
+  xTaskCreatePinnedToCore(Output_Task,"Output_Task", 2048, NULL, 0, &hTask[OUTPUT_TASKID], 1);
   xTaskCreatePinnedToCore(Input_Task,"Input_Task", 4096, NULL, 4, &hTask[INPUT_TASKID], 1);
-  xTaskCreatePinnedToCore(CANLCD_Task,"CANLCD_Task", 4096, NULL, 5, &hTask[CANLCD_TASKID], 0);
-  xTaskCreatePinnedToCore(DoS_Task,"DoS_Task", 2048, NULL, 3, &hTask[DOS_TASKID], 1);
+  xTaskCreatePinnedToCore(CANLCD_Task,"CANLCD_Task", 8192, NULL, 0, &hTask[CANLCD_TASKID], 0);
+  xTaskCreatePinnedToCore(Periodic_Task,"Periodic_Task", 2048, NULL, 3, &hTask[PERIODIC_TASKID], 1);
 }
 
 // =================
 //  Idle Task
 // =================
-static int loopCnt = 0;
+int cnt = 0;
+unsigned long can_rxPPStm = 0;
+int can_rxCntTmp = 0;
 
 void loop() {
   // put your main code here, to run repeatedly:
-  //Serial.printf("Loop():%d\r\n", loopCnt++);
-  CANLCDMESSAGE  msg;
-  msg.msg = CANLCDMSG_LCDDISP;
-  xQueueSend(xCANLCDMsgQue, &msg, NULL);
+  xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_LCDDISP);
   vTaskDelay(100);
-#ifdef CANDUMMY
-  msg.msg = CANLCDMSG_CANRECV;
-  xQueueSendToFront(xCANLCDMsgQue, &msg, NULL);
-#endif
+  M5.update();
+
+  if(can_rxPPStm == 0) {
+    can_rxPPS = 0;
+    can_rxPPStm = millis();
+    can_rxCntTmp = can_rxCnt;
+  } else {
+    if( (millis() - can_rxPPStm) >= 1000) {
+      can_rxPPS = (int)((double)(can_rxCnt - can_rxCntTmp) / ((double)(millis() - can_rxPPStm) / 1000.0));
+      can_rxPPStm = millis();
+      can_rxCntTmp = can_rxCnt;
+    }
+  }
+//  Serial.printf("%d\r\n", cnt ++);
 }
