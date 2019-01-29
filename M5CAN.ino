@@ -22,6 +22,8 @@
 #include "freertos/queue.h"
 #include "mcp_can.h"
 
+#include <esp_wpa2.h>
+
 //#define CANDUMMY
 
 
@@ -78,7 +80,7 @@ typedef struct CANMessage {
 File file;
 const char* M5CAN_HWStr = "M5CAN";
 const char* M5CAN_HWVer = "V0100";
-const char* M5CAN_SWVer = "v0004";
+const char* M5CAN_SWVer = "v0005";
 
 #define RECVLOGMAX  5
 OUTPUTMESSAGE recvlog[RECVLOGMAX];
@@ -112,6 +114,7 @@ void readFile(fs::FS &fs, const char * path, char* buf, int len) {
   }
   file.close();
 }
+
 
 // =================
 void SD_setup(void) {
@@ -221,22 +224,107 @@ void CAN_DummyRecv(CANMESSAGE *msg) {
 #include <WiFiClient.h>
 #include <WiFiAP.h>
 
-const char *ssid = "M5CAN AP";
-const char *password = "m5candoit";
-char  ssidbuf[32];
+
+char WIFI_ssid[64];
+char WIFI_pass[64];
+char WIFI_idet[64];
+char WIFI_user[64];
 
 volatile bool WIFI_bConnected = false;
+bool WIFI_bClient = false;
+bool WIFI_bClientWPA2 = false;
 
 WiFiServer server(23);    //  Telnet port
 WiFiClient client;
 
+String readline(File& file) {
+  String str = "";
+  
+  while(file.available() > 0) {
+    char ch = file.read();
+
+    if(ch=='\r' || ch=='\n') {
+      if(str.startsWith("#")) {
+        str = "";
+        continue;
+      }
+      break;
+    }
+    str += ch;
+  }
+
+  return str;
+}
+
+
+// =================
+bool WIFIreadFile(fs::FS &fs, const char * path) {
+  File file = fs.open(path);
+  if(!file){
+    return false;
+  }
+  
+  String str;
+  str = readline(file);
+  strncpy(WIFI_ssid, str.c_str(), sizeof(WIFI_ssid)-1);
+  str = readline(file);
+  strncpy(WIFI_pass, str.c_str(), sizeof(WIFI_pass)-1);
+  str = readline(file);
+  strncpy(WIFI_idet, str.c_str(), sizeof(WIFI_idet)-1);
+  str = readline(file);
+  strncpy(WIFI_user, str.c_str(), sizeof(WIFI_user)-1);
+
+  file.close();
+
+  return true;
+}
+
 // =================
 void WIFIInit() {
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  sprintf(ssidbuf, "%s-%02X%02X", ssid, mac[4], mac[5]);
-  WiFi.softAP(ssidbuf, password);
-  
+
+  WiFi.disconnect(true);
+
+  if(WIFIreadFile(SD, "/wifi.txt")) {
+    WIFI_bClient = true;
+    if((strlen(WIFI_idet) == 0) && (strlen(WIFI_user) == 0)) {
+      WIFI_bClientWPA2 = false;
+    } else {
+      WIFI_bClientWPA2 = true;
+    }
+  }
+
+  if(WIFI_bClient) {
+    WiFi.mode(WIFI_STA);
+    if(WIFI_bClientWPA2) {
+      esp_wifi_sta_wpa2_ent_set_identity((uint8_t *)WIFI_idet, strlen(WIFI_idet)); 
+      esp_wifi_sta_wpa2_ent_set_username((uint8_t *)WIFI_user, strlen(WIFI_user)); 
+      esp_wifi_sta_wpa2_ent_set_password((uint8_t *)WIFI_pass, strlen(WIFI_pass)); 
+      esp_wpa2_config_t config = WPA2_CONFIG_INIT_DEFAULT();
+      esp_wifi_sta_wpa2_ent_enable(&config);
+      WiFi.begin(WIFI_ssid);
+    } else {
+      WiFi.begin(WIFI_ssid, WIFI_pass); 
+    }
+
+    for(int i=0;i<100;i++) {
+      if(WiFi.status() == WL_CONNECTED) {
+        break;
+      }
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setTextColor(RED, BLACK);
+      M5.Lcd.setFreeFont(FM12);
+      M5.Lcd.drawRightString("Wait for Wi-Fi Connect", (M5.Lcd.width()/4)*2, M5.Lcd.height()/2, GFXFF);
+      M5.update();
+      delay(100);
+    }
+  } else {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    sprintf(WIFI_ssid, "M5CAN AP-%02X%02X", mac[4], mac[5]);
+    strcpy(WIFI_pass, "m5candoit");
+    WiFi.softAP(WIFI_ssid, WIFI_pass);
+  }
+
   server.begin();  
 }
 
@@ -508,14 +596,18 @@ char* file_chrptr = NULL;
 char file_recvBuf[32];
 char file_recvCnt = 0;
 
+#include <driver/dac.h>
+
 void beep() {
   // Beep (silent)
+  dac_output_enable(DAC_CHANNEL_1);
   for(int i=0; i<10; i++) {
     dacWrite(SPEAKER_PIN, 6);
     delayMicroseconds(2272/2);
     dacWrite(SPEAKER_PIN, 0);
     delayMicroseconds(2272/2);
   }
+  dac_output_disable(DAC_CHANNEL_1);
 }
 
 void FILELoop() {
@@ -525,7 +617,7 @@ void FILELoop() {
     if(file_chrptr == NULL) {
       file_chrptr = file1;
       beep();
-      vTaskDelay(100);
+      vTaskDelay(100/portTICK_RATE_MS);
     }
   }
 
@@ -533,7 +625,7 @@ void FILELoop() {
     if(file_chrptr == NULL) {
       file_chrptr = file2;
       beep();
-      vTaskDelay(100);
+      vTaskDelay(100/portTICK_RATE_MS);
     }
   }
 
@@ -541,7 +633,7 @@ void FILELoop() {
     if(file_chrptr == NULL) {
       file_chrptr = file3;
       beep();
-      vTaskDelay(100);
+      vTaskDelay(100/portTICK_RATE_MS);
     }
   }
   
@@ -562,11 +654,11 @@ void FILELoop() {
 void Input_Task(void *pvParameters) {
   while(true) {
     SERIALLoop();
-    vTaskDelay(1);
+    vTaskDelay(1/portTICK_RATE_MS);
     WIFILoop();
-    vTaskDelay(1);
+    vTaskDelay(1/portTICK_RATE_MS);
     FILELoop();
-    vTaskDelay(1);
+    vTaskDelay(1/portTICK_RATE_MS);
   }
 }
 
@@ -615,7 +707,7 @@ void Display_Banner() {
   ypos += M5.Lcd.fontHeight(GFXFF);
   M5.Lcd.drawRightString("Useful CAN Tool", xpos, ypos, GFXFF);
   M5.update();
-  vTaskDelay(1000);
+  vTaskDelay(1000/portTICK_RATE_MS);
   M5.Lcd.fillScreen(BLACK);
   M5.update();
   display_sequencer = -4;
@@ -645,14 +737,19 @@ void Display() {
       break;
     }
     case -2: {
-      sprintf(buf,"SSID:%s\r\n", ssidbuf);
+      sprintf(buf,"SSID:%s", WIFI_ssid);
       M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
       ypos += M5.Lcd.fontHeight(GFXFF);
       break;
     }
     case -1: {
-      IPAddress myIP = WiFi.softAPIP();
-      sprintf(buf,"IP:%d.%d.%d.%d\r\n", myIP[0], myIP[1], myIP[2], myIP[3]);
+      IPAddress myIP;
+      
+      if(WIFI_bClient) {
+        sprintf(buf,"IP:%s", WiFi.localIP().toString().c_str());
+      } else {
+        sprintf(buf,"IP:%s", WiFi.softAPIP().toString().c_str());
+      }
       M5.Lcd.drawString(buf, xpos, ypos, GFXFF);
       ypos += M5.Lcd.fontHeight(GFXFF);
       break;
@@ -669,6 +766,7 @@ void Display() {
         M5.Lcd.setTextColor(WHITE, BLACK);
       }
       M5.Lcd.drawString("Wi-Fi", 240, 0, GFXFF);
+      M5.Lcd.setTextColor(WHITE, BLACK);
       break;  
     }
     case 1: {
@@ -740,7 +838,7 @@ void CANLCD_Task(void *pvParameters) {
 
   pinMode(CAN_INTPIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(CAN_INTPIN), CAN_RecvIsr, FALLING);
-  vTaskDelay(10);
+  vTaskDelay(10/portTICK_RATE_MS);
   CAN_setup();
  
   while(true) {
@@ -866,11 +964,11 @@ void Periodic_Task(void *pvParameters) {
         if(can_periodicincrement) {
           Periodic_IncMsg();
         }
-        vTaskDelay(can_periodiccycle);
+        vTaskDelay(can_periodiccycle/portTICK_RATE_MS);
       }
       can_periodicmode = 0;
     }
-    vTaskDelay(100);
+    vTaskDelay(100/portTICK_RATE_MS);
   }
 }
 
@@ -911,7 +1009,7 @@ int can_rxCntTmp = 0;
 void loop() {
   // put your main code here, to run repeatedly:
   xEventGroupSetBits(xCANLCDEvtGrp, CANLCDEVT_LCDDISP);
-  vTaskDelay(100);
+  vTaskDelay(100/portTICK_RATE_MS);
   M5.update();
 
   if(can_rxPPStm == 0) {
