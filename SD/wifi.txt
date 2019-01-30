@@ -1,0 +1,11 @@
+# WEP/WPA/WPA2 personalの時は、
+#   SSID
+#   PASSWORD
+#
+# WPA2 Enterpriseの時は、
+#   SSID
+#   PASSWORD
+#   IDENTITY(不明な場合井空白行)
+#   USER
+SSIDname
+Password

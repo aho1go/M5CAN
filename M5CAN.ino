@@ -16,17 +16,15 @@
 
 #include <M5Stack.h>
 #include "Free_Fonts.h" // Include the header file attached to this sketch
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "mcp_can.h"
-
 #include <esp_wpa2.h>
+#include "SPIFFS.h"
 
-//#define CANDUMMY
 
-
+// =================
 #define ConvBtoA(a) ("0123456789ABCDEF"[a & 0x0F])
 #define CONV_AtoB(a) ((a >= 'a') ? (a - 'a' + 10) : (a >= 'A') ? (a - 'A' + 10) : (a >= 0) ? (a - '0') : 0)
 
@@ -80,60 +78,11 @@ typedef struct CANMessage {
 File file;
 const char* M5CAN_HWStr = "M5CAN";
 const char* M5CAN_HWVer = "V0100";
-const char* M5CAN_SWVer = "v0005";
+const char* M5CAN_SWVer = "v0006";
 
 #define RECVLOGMAX  5
 OUTPUTMESSAGE recvlog[RECVLOGMAX];
 int recvlog_idx = 0;
-
-// =================
-//  SD
-// =================
-char file1[128];
-char file2[128];
-char file3[128];
-
-// =================
-void readFile(fs::FS &fs, const char * path, char* buf, int len) {
-//  Serial.printf("Reading file: %s\n", path);
-  
-  File file = fs.open(path);
-  if(!file){
-    return;
-  }
-  
-//  Serial.print("Read from file: ");
-  for( int i=0; i<len-1; i++) {
-    if(!file.available()) {
-      break;
-    }
-    int ch = file.read();
-  
-    buf[i] = (char)ch;
-    buf[i+1] = '\0';
-  }
-  file.close();
-}
-
-
-// =================
-void SD_setup(void) {
-  char* ptr;
-
-  if(!SD.begin()){
-//    Serial.println("Card Mount Failed");
-    return;
-  }
-
-  memset(file1, 0, sizeof(file1));
-  memset(file2, 0, sizeof(file2));
-  memset(file3, 0, sizeof(file3));
-  
-  readFile(SD, "/button1.txt", file1, sizeof(file1));
-  readFile(SD, "/button2.txt", file2, sizeof(file2));
-  readFile(SD, "/button3.txt", file3, sizeof(file3));
-//  Serial.println(file1);
-}
 
 
 // =================
@@ -199,23 +148,23 @@ void CAN_close() {
   CAN.setMode(MCP_SLEEP);
 }
 
+
 // =================
-#ifdef CANDUMMY
-void CAN_DummyRecv(CANMESSAGE *msg) {
-  if(random(100) < 50) {
-    msg->ID = random(0x800);
-  } else {
-    msg->ID = random(0x20000000) | 0x80000000;
-  }      
-  if(random(100) < 50) {
-    msg->ID |= 0x40000000;
-  }      
-  msg->DLC = random(9);
-  for(char i=0; i<msg->DLC; i++) {
-    msg->Data[i] = random(256); 
+//  Beep
+// =================
+#include <driver/dac.h>
+void beep() {
+  // Beep (silent)
+  dac_output_enable(DAC_CHANNEL_1);
+  for(int i=0; i<10; i++) {
+    dacWrite(SPEAKER_PIN, 6);
+    delayMicroseconds(2272/2);
+    dacWrite(SPEAKER_PIN, 0);
+    delayMicroseconds(2272/2);
   }
+  dac_output_disable(DAC_CHANNEL_1);
 }
-#endif
+
 
 // =================
 //  Wi-Fi
@@ -223,7 +172,6 @@ void CAN_DummyRecv(CANMESSAGE *msg) {
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiAP.h>
-
 
 char WIFI_ssid[64];
 char WIFI_pass[64];
@@ -233,58 +181,18 @@ char WIFI_user[64];
 volatile bool WIFI_bConnected = false;
 bool WIFI_bClient = false;
 bool WIFI_bClientWPA2 = false;
+bool WIFI_bFileExist = false;
 
 WiFiServer server(23);    //  Telnet port
 WiFiClient client;
 
-String readline(File& file) {
-  String str = "";
-  
-  while(file.available() > 0) {
-    char ch = file.read();
-
-    if(ch=='\r' || ch=='\n') {
-      if(str.startsWith("#")) {
-        str = "";
-        continue;
-      }
-      break;
-    }
-    str += ch;
-  }
-
-  return str;
-}
-
-
-// =================
-bool WIFIreadFile(fs::FS &fs, const char * path) {
-  File file = fs.open(path);
-  if(!file){
-    return false;
-  }
-  
-  String str;
-  str = readline(file);
-  strncpy(WIFI_ssid, str.c_str(), sizeof(WIFI_ssid)-1);
-  str = readline(file);
-  strncpy(WIFI_pass, str.c_str(), sizeof(WIFI_pass)-1);
-  str = readline(file);
-  strncpy(WIFI_idet, str.c_str(), sizeof(WIFI_idet)-1);
-  str = readline(file);
-  strncpy(WIFI_user, str.c_str(), sizeof(WIFI_user)-1);
-
-  file.close();
-
-  return true;
-}
 
 // =================
 void WIFIInit() {
 
   WiFi.disconnect(true);
 
-  if(WIFIreadFile(SD, "/wifi.txt")) {
+  if(WIFI_bFileExist) {
     WIFI_bClient = true;
     if((strlen(WIFI_idet) == 0) && (strlen(WIFI_user) == 0)) {
       WIFI_bClientWPA2 = false;
@@ -342,9 +250,9 @@ void WIFILoop() {
   if(client.connected()) {
     WIFI_bConnected = true;
     
-    while(client.available()) {             // if there's bytes to read from the client,
+    while(client.available()) {
       bool input_slcancmd(char* buf, char bufmax, char* pCnt, char ch, bool bFile);
-      char c = client.read();             // read a byte, then
+      char c = client.read(); 
       input_slcancmd(WIFI_recvBuf, sizeof(WIFI_recvBuf), &WIFI_recvCnt, c, false);
     }
   } else {
@@ -353,8 +261,7 @@ void WIFILoop() {
       client.stop();
     } else {
       if(server.hasClient()) {
-        client = server.available();   // listen for incoming clients
-        //  Serial.println("WiFi Client Connect");
+        client = server.available();
       }
     }
   }
@@ -365,6 +272,145 @@ void WIFISend(char* msg) {
   if(WIFIConnected()) {
     client.println(msg);
   }
+}
+
+
+// =================
+//  SD
+// =================
+char file1[128];
+char file2[128];
+char file3[128];
+
+// =================
+bool readFile(fs::FS &fs, const char * path, char* buf, int len, int* plen) {
+  File file = fs.open(path);
+  bool bResult = false;
+  
+  if(file) {
+    if((file.size()+1) < len) {
+      file.readBytes(buf, file.size());
+      buf[file.size()] = '\0';
+    }
+    if(plen != NULL) {
+      *plen = file.size();
+    }
+    file.close();
+    bResult = true;
+  }
+//  Serial.printf("readFile:%s:[%s]\r\n", path, buf);
+  return bResult;
+}
+
+// =================
+bool writeFile(fs::FS &fs, const char * path, char* buf, int len) {
+  File file = fs.open(path, FILE_WRITE);
+  if(!file) {
+    return false;
+  }
+  file.write((uint8_t*)buf, len);
+  file.close();
+//  Serial.printf("writeFile:%s:[%s]\r\n", path, buf);
+  return true;
+}
+
+// =================
+String readline(File& file) {
+  String str = "";
+  
+  while(file.available() > 0) {
+    char ch = file.read();
+    if(ch=='\r' || ch=='\n') {
+      if(str.startsWith("#")) {
+        str = "";
+        continue;
+      }
+      break;
+    }
+    str += ch;
+  }
+//  Serial.printf("readline:[%s]\r\n", str.c_str());
+  return str;
+}
+
+// =================
+void ReadWifiFile(const char* path, char* buf1, int buf1len, char* buf2, int buf2len, char* buf3, int buf3len, char* buf4, int buf4len) {
+  char buf[1024];
+  int len = sizeof(buf);
+  
+  memset(buf, 0, len);
+
+  if(SD.exists(path)) {
+    int flen;
+    if(readFile(SD, path, buf, len, &flen)) {
+      writeFile(SPIFFS, path, buf, flen);
+    }
+  }
+
+  if(SPIFFS.exists(path)) {
+    File file = SPIFFS.open(path);
+    if(file) {
+      String str;
+      str = readline(file);
+      strncpy(buf1, str.c_str(), buf1len);
+      str = readline(file);
+      strncpy(buf2, str.c_str(), buf2len);
+      str = readline(file);
+      strncpy(buf3, str.c_str(), buf3len);
+      str = readline(file);
+      strncpy(buf4, str.c_str(), buf4len);    
+      file.close();
+  
+      WIFI_bFileExist = true;
+    }
+  }
+}
+
+// =================
+void ReadButtonFile(const char* path, char* buf, int len) {
+  memset(buf, 0, len);
+
+  if(SD.exists(path)) {
+    int flen;
+    if(readFile(SD, path, buf, len, &flen)) {
+      writeFile(SPIFFS, path, buf, flen);
+    }
+  }
+  readFile(SPIFFS, path, buf, len, NULL);
+}
+
+// =================
+void FILE_setup(void) {
+
+  SPIFFS.begin(true);
+  SD.begin();
+
+  memset(file1, 0, sizeof(file1));
+  memset(file2, 0, sizeof(file2));
+  memset(file3, 0, sizeof(file3));
+
+  M5.update();
+  if(M5.BtnA.isPressed()) {
+    beep();
+    vTaskDelay(100/portTICK_RATE_MS);
+    beep();
+    vTaskDelay(100/portTICK_RATE_MS);
+    beep();
+    vTaskDelay(100/portTICK_RATE_MS);
+
+    SPIFFS.format();
+  }
+  
+  ReadButtonFile("/button1.txt", file1, sizeof(file1));
+  ReadButtonFile("/button2.txt", file2, sizeof(file2));
+  ReadButtonFile("/button3.txt", file3, sizeof(file3));
+
+  ReadWifiFile("/wifi.txt", 
+                WIFI_ssid, sizeof(WIFI_ssid),
+                WIFI_pass, sizeof(WIFI_pass),
+                WIFI_idet, sizeof(WIFI_idet),
+                WIFI_user, sizeof(WIFI_user) );
+
 }
 
 
@@ -596,20 +642,6 @@ char* file_chrptr = NULL;
 char file_recvBuf[32];
 char file_recvCnt = 0;
 
-#include <driver/dac.h>
-
-void beep() {
-  // Beep (silent)
-  dac_output_enable(DAC_CHANNEL_1);
-  for(int i=0; i<10; i++) {
-    dacWrite(SPEAKER_PIN, 6);
-    delayMicroseconds(2272/2);
-    dacWrite(SPEAKER_PIN, 0);
-    delayMicroseconds(2272/2);
-  }
-  dac_output_disable(DAC_CHANNEL_1);
-}
-
 void FILELoop() {
   char ch;
 
@@ -799,7 +831,6 @@ void Display() {
       ypos += M5.Lcd.fontHeight(GFXFF)*2;
       break;
     }
-
     case 6:
     case 7:
     case 8:
@@ -905,7 +936,6 @@ void CANLCD_Task(void *pvParameters) {
         msgbuf[msgbufIdx++] = '\r';
         msgbuf[msgbufIdx++] = '\0';
 
-
         strcpy(recvlog[can_rxCnt % RECVLOGMAX].msg, outmsg.msg);
         if(can_rxCnt >= RECVLOGMAX) {
           recvlog_idx = (recvlog_idx+1) % RECVLOGMAX;
@@ -984,10 +1014,9 @@ void setup() {
   
   Display_Banner();
 
-  SD_setup();
+  FILE_setup();
 
   xCANLCDEvtGrp = xEventGroupCreate();
-
   xCANSendMsgQue = xQueueCreate(CANMESSAGE_QMAX, sizeof(CANMESSAGE));
   xOutputMsgQue = xQueueCreate(OUTPUTMESSAGE_QMAX, sizeof(OUTPUTMESSAGE));
 
